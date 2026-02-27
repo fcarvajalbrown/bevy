@@ -299,6 +299,58 @@ pub trait IntoSystem<In: SystemInput, Out, Marker>: Sized {
         WithInputFromWrapper::new(self)
     }
 
+    /// Passes a shared reference to `value` as input to the system each run,
+    /// turning it into a system that takes no input.
+    ///
+    /// `Self` can have any [`SystemInput`] type that takes a shared reference
+    /// to `T`, such as [`InRef`].
+    ///
+    /// Unlike [`with_input`](Self::with_input), the system cannot mutate the
+    /// stored value. This makes it suitable when multiple parallel systems
+    /// need to observe the same value without being able to change it.
+    ///
+    /// # Example
+    /// ```
+    /// # use bevy_ecs::prelude::*;
+    /// fn my_system(input: InRef<u32>) {
+    ///     assert_eq!(*input, 42);
+    /// }
+    /// let mut world = World::new();
+    /// let mut system = IntoSystem::into_system(my_system).with_input_ref(42u32);
+    /// system.initialize(&mut world);
+    /// system.run((), &mut world);
+    /// ```
+    fn with_input_ref<T>(self, value: T) -> WithRefInputWrapper<Self::System, T>
+    where
+        for<'i> In: SystemInput<Inner<'i> = &'i T>,
+        T: Send + Sync + 'static,
+    {
+        WithRefInputWrapper::new(self, value)
+    }
+
+    /// Passes a cloned copy of `value` as input to the system each run,
+    /// turning it into a system that takes no input.
+    ///
+    /// `Self` can have any [`SystemInput`] type whose inner representation is
+    /// an owned `T`, such as [`In`].
+    ///
+    /// Because [`In<T>`](crate::system::In) transfers ownership of `T` into
+    /// the system, `T` must be [`Clone`] so the system can run more than once.
+    /// The clone is performed inside the wrapper on every run; the original
+    /// stored value is never consumed. For [`Copy`] types the clone is a free
+    /// bit-copy.
+    ///
+    /// # Example
+    ///
+    /// Pending.
+    fn with_cloned_input<T>(self, value: T) -> WithClonedInputWrapper<Self::System, T>
+    where
+        for<'i> In: SystemInput<Inner<'i> = T>,
+        T: Clone + Send + Sync + 'static,
+    {
+        WithClonedInputWrapper::new(self, value)
+    }
+
     /// Get the [`TypeId`] of the [`System`] produced after calling [`into_system`](`IntoSystem::into_system`).
     #[inline]
     fn system_type_id(&self) -> TypeId {
@@ -396,7 +448,7 @@ pub fn assert_system_does_not_conflict<Out, Params, S: IntoSystem<(), Out, Param
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "Allowed in tests.")]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::{string::String, vec, vec::Vec};
     use bevy_utils::default;
     use core::any::TypeId;
     use std::println;
@@ -418,8 +470,8 @@ mod tests {
             SystemCondition,
         },
         system::{
-            Commands, ExclusiveMarker, In, InMut, IntoSystem, Local, NonSend, NonSendMut, ParamSet,
-            Query, Res, ResMut, Single, StaticSystemParam, System, SystemState,
+            Commands, ExclusiveMarker, In, InMut, InRef, IntoSystem, Local, NonSend, NonSendMut,
+            ParamSet, Query, Res, ResMut, Single, StaticSystemParam, System, SystemState,
         },
         world::{DeferredWorld, EntityMut, FromWorld, World},
     };
@@ -1908,7 +1960,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "debug"), ignore)]
     #[should_panic(
         expected = "Encountered an error in system `bevy_ecs::system::tests::simple_fallible_system::sys`: error"
     )]
@@ -1923,7 +1974,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "debug"), ignore)]
     #[should_panic(
         expected = "Encountered an error in system `bevy_ecs::system::tests::simple_fallible_exclusive_system::sys`: error"
     )]
@@ -1936,7 +1986,6 @@ mod tests {
         let mut world = World::new();
         run_system(&mut world, sys);
     }
-
     // Regression test for
     // https://github.com/bevyengine/bevy/issues/18778
     //
@@ -2023,5 +2072,60 @@ mod tests {
         assert!(system.value().is_some());
         system.run((), &mut world).unwrap();
         assert_eq!(system.value().unwrap().0, 6);
+    }
+
+    #[test]
+    fn with_input_ref_passes_shared_reference() {
+        fn sys(InRef(v): InRef<usize>) -> usize {
+            *v
+        }
+
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(sys.with_input_ref(42_usize));
+        system.initialize(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), 42);
+        assert_eq!(system.run((), &mut world).unwrap(), 42);
+    }
+
+    #[test]
+    fn with_input_ref_value_mut_affects_subsequent_runs() {
+        fn sys(InRef(v): InRef<usize>) -> usize {
+            *v
+        }
+
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(sys.with_input_ref(10_usize));
+        system.initialize(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), 10);
+        *system.value_mut() = 99;
+        assert_eq!(system.run((), &mut world).unwrap(), 99);
+    }
+
+    #[test]
+    fn with_cloned_input_clones_on_every_run() {
+        fn sys(In(s): In<String>) -> usize {
+            s.len()
+        }
+
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(sys.with_cloned_input(String::from("hello")));
+        system.initialize(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), 5);
+        assert_eq!(system.run((), &mut world).unwrap(), 5);
+        assert_eq!(system.run((), &mut world).unwrap(), 5);
+    }
+
+    #[test]
+    fn with_cloned_input_value_mut_affects_subsequent_runs() {
+        fn sys(In(s): In<String>) -> usize {
+            s.len()
+        }
+
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(sys.with_cloned_input(String::from("hi")));
+        system.initialize(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), 2);
+        *system.value_mut() = String::from("longer string");
+        assert_eq!(system.run((), &mut world).unwrap(), 13);
     }
 }
