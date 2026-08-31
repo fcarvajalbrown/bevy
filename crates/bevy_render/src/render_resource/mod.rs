@@ -10,6 +10,7 @@ mod gpu_array_buffer;
 mod pipeline;
 mod pipeline_cache;
 mod pipeline_specializer;
+mod sparse_buffer_vec;
 mod specializer;
 mod storage_buffer;
 mod texture;
@@ -26,6 +27,7 @@ pub use gpu_array_buffer::*;
 pub use pipeline::*;
 pub use pipeline_cache::*;
 pub use pipeline_specializer::*;
+pub use sparse_buffer_vec::*;
 pub use specializer::*;
 pub use storage_buffer::*;
 pub use texture::*;
@@ -69,8 +71,6 @@ pub mod encase {
 }
 
 pub use self::encase::{ShaderSize, ShaderType};
-
-pub use naga::ShaderStage;
 
 pub use bevy_material::{
     bind_group_layout_entries::{

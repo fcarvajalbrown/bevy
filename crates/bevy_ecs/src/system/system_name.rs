@@ -2,7 +2,10 @@ use crate::{
     change_detection::Tick,
     prelude::World,
     query::FilteredAccessSet,
-    system::{ExclusiveSystemParam, ReadOnlySystemParam, SystemMeta, SystemParam},
+    system::{
+        ExclusiveSystemParam, ReadOnlySystemParam, SystemMeta, SystemParam,
+        SystemParamValidationError,
+    },
     world::unsafe_world_cell::UnsafeWorldCell,
 };
 use bevy_utils::prelude::DebugName;
@@ -42,6 +45,11 @@ impl SystemName {
     pub fn name(&self) -> DebugName {
         self.0.clone()
     }
+
+    /// Gets a string reference of the name of the system.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 // SAFETY: no component value access
@@ -65,8 +73,8 @@ unsafe impl SystemParam for SystemName {
         system_meta: &SystemMeta,
         _world: UnsafeWorldCell<'w>,
         _change_tick: Tick,
-    ) -> Self::Item<'w, 's> {
-        SystemName(system_meta.name.clone())
+    ) -> Result<Self::Item<'w, 's>, SystemParamValidationError> {
+        Ok(SystemName(system_meta.name.clone()))
     }
 }
 
@@ -79,8 +87,11 @@ impl ExclusiveSystemParam for SystemName {
 
     fn init(_world: &mut World, _system_meta: &mut SystemMeta) -> Self::State {}
 
-    fn get_param<'s>(_state: &'s mut Self::State, system_meta: &SystemMeta) -> Self::Item<'s> {
-        SystemName(system_meta.name.clone())
+    fn get_param<'s>(
+        _state: &'s mut Self::State,
+        system_meta: &SystemMeta,
+    ) -> Result<Self::Item<'s>, SystemParamValidationError> {
+        Ok(SystemName(system_meta.name.clone()))
     }
 }
 

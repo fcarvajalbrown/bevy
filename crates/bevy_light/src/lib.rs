@@ -5,29 +5,31 @@
 extern crate alloc;
 
 use bevy_app::{App, Plugin, PostUpdate, Update};
-use bevy_asset::AssetApp;
+use bevy_asset::{AssetApp, AssetEventSystems};
 use bevy_camera::{
     primitives::{Aabb, CascadesFrusta, CubemapFrusta, Frustum, Sphere},
     visibility::{
-        CascadesVisibleEntities, CubemapVisibleEntities, InheritedVisibility, NoFrustumCulling,
-        RenderLayers, ViewVisibility, VisibilityRange, VisibilitySystems, VisibleEntityRanges,
-        VisibleMeshEntities,
+        CascadesVisibleEntities, CubemapVisibleEntities, InheritedVisibility, NoCpuCulling,
+        NoFrustumCulling, RenderLayers, ViewVisibility, VisibilityRange, VisibilitySystems,
+        VisibleEntities, VisibleEntityRanges, VisibleMeshEntities,
     },
-    Camera3d, CameraUpdateSystems,
+    Camera, Camera3d, CameraUpdateSystems, RenderTarget, ShadowLodOrigin,
 };
-use bevy_ecs::{entity::EntityHashSet, prelude::*};
+use bevy_ecs::{entity::EntityHashSet, prelude::*, system::QueryLens};
 #[cfg(feature = "bevy_gizmos")]
 use bevy_gizmos::frustum::FrustumGizmoSystems;
+use bevy_log::warn_once;
 use bevy_math::Vec3A;
 use bevy_mesh::Mesh3d;
 use bevy_reflect::prelude::*;
 use bevy_transform::{components::GlobalTransform, TransformSystems};
 use bevy_utils::Parallel;
-use core::{mem, ops::DerefMut};
+use core::{any::TypeId, mem, ops::DerefMut};
+use smallvec::{smallvec, SmallVec};
 
 pub mod cluster;
+use cluster::assign::assign_objects_to_clusters;
 pub use cluster::ClusteredDecal;
-use cluster::{assign::assign_objects_to_clusters, VisibleClusterableObjects};
 mod ambient_light;
 pub use ambient_light::{AmbientLight, GlobalAmbientLight};
 use bevy_camera::visibility::SetViewVisibility;
@@ -59,6 +61,8 @@ pub use directional_light::{
     update_directional_light_frusta, DirectionalLight, DirectionalLightShadowMap,
     DirectionalLightTexture, SunDisk,
 };
+mod rect_light;
+pub use rect_light::RectLight;
 /// Provides gizmo drawing for visualizing light positions.
 #[cfg(feature = "bevy_gizmos")]
 pub mod gizmos;
@@ -70,7 +74,8 @@ pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
         light_consts, AmbientLight, DirectionalLight, EnvironmentMapLight,
-        GeneratedEnvironmentMapLight, GlobalAmbientLight, LightProbe, PointLight, SpotLight,
+        GeneratedEnvironmentMapLight, GlobalAmbientLight, LightProbe, PointLight, RectLight,
+        SpotLight,
     };
 
     #[doc(hidden)]
@@ -79,8 +84,8 @@ pub mod prelude {
 }
 
 use crate::{
-    atmosphere::ScatteringMedium,
-    cluster::{add_light_probe_and_decal_aabbs, Clusters},
+    atmosphere::{extract_chromatic_phase_textures, ScatteringMedium},
+    cluster::{add_light_probe_and_decal_aabbs, ClusterVisibilityClass, Clusters},
     directional_light::validate_shadow_map_size,
     point_light::update_point_light_bounding_spheres,
     spot_light::update_spot_light_bounding_spheres,
@@ -169,6 +174,11 @@ impl Plugin for LightPlugin {
                 SimulationLightSystems::CheckLightVisibility
                     .ambiguous_with(SimulationLightSystems::CheckLightVisibility),
             )
+            .configure_sets(
+                PostUpdate,
+                SimulationLightSystems::AssignLightsToClusters
+                    .before(bevy_app::TransformGizmoRenderStep),
+            )
             .add_systems(Update, automatically_add_parallax_correction_components)
             .add_systems(
                 PostUpdate,
@@ -219,8 +229,8 @@ impl Plugin for LightPlugin {
                         .after(VisibilitySystems::CheckVisibility)
                         .before(VisibilitySystems::MarkNewlyHiddenEntitiesInvisible),
                     (
-                        update_point_light_bounding_spheres,
-                        update_spot_light_bounding_spheres,
+                        update_point_light_bounding_spheres.after(TransformSystems::Propagate),
+                        update_spot_light_bounding_spheres.after(TransformSystems::Propagate),
                         add_light_probe_and_decal_aabbs,
                     )
                         .in_set(SimulationLightSystems::UpdateBounds)
@@ -228,7 +238,9 @@ impl Plugin for LightPlugin {
                     build_directional_light_cascades
                         .in_set(SimulationLightSystems::UpdateDirectionalLightCascades)
                         .after(TransformSystems::Propagate)
+                        .before(bevy_app::TransformGizmoRenderStep)
                         .after(CameraUpdateSystems),
+                    extract_chromatic_phase_textures.after(AssetEventSystems),
                 ),
             );
 
@@ -238,8 +250,13 @@ impl Plugin for LightPlugin {
 }
 
 /// A convenient alias for `Or<(With<PointLight>, With<SpotLight>,
-/// With<DirectionalLight>)>`, for use with [`bevy_camera::visibility::VisibleEntities`].
-pub type WithLight = Or<(With<PointLight>, With<SpotLight>, With<DirectionalLight>)>;
+/// With<DirectionalLight>, With<RectLight>)>`, for use with [`bevy_camera::visibility::VisibleEntities`].
+pub type WithLight = Or<(
+    With<PointLight>,
+    With<SpotLight>,
+    With<DirectionalLight>,
+    With<RectLight>,
+)>;
 
 /// Add this component to make a [`Mesh3d`] not cast shadows.
 #[derive(Debug, Component, Reflect, Default, Clone, PartialEq)]
@@ -250,7 +267,7 @@ pub struct NotShadowCaster;
 /// **Note:** If you're using diffuse transmission, setting [`NotShadowReceiver`] will
 /// cause both “regular” shadows as well as diffusely transmitted shadows to be disabled,
 /// even when [`TransmittedShadowReceiver`] is being used.
-#[derive(Debug, Component, Reflect, Default)]
+#[derive(Debug, Component, Reflect, Default, Clone)]
 #[reflect(Component, Default, Debug)]
 pub struct NotShadowReceiver;
 /// Add this component to make a [`Mesh3d`] using a PBR material with `StandardMaterial::diffuse_transmission > 0.0`
@@ -260,7 +277,7 @@ pub struct NotShadowReceiver;
 /// (and potentially even baking a thickness texture!) to match the geometry of the mesh, in order to avoid self-shadow artifacts.
 ///
 /// **Note:** Using [`NotShadowReceiver`] overrides this component.
-#[derive(Debug, Component, Reflect, Default)]
+#[derive(Debug, Component, Reflect, Default, Clone)]
 #[reflect(Component, Default, Debug)]
 pub struct TransmittedShadowReceiver;
 
@@ -317,7 +334,11 @@ pub enum SimulationLightSystems {
     CheckLightVisibility,
 }
 
-/// Updates the visibility for [`DirectionalLight`]s so that shadow map rendering can work.
+/// Updates the visibility for [`DirectionalLight`]s so that shadow map
+/// rendering can work.
+///
+/// This only processes entities without [`NoCpuCulling`]. Entities with
+/// [`NoCpuCulling`] receive no view-specific processing in the main world.
 pub fn check_dir_light_mesh_visibility(
     mut commands: Commands,
     mut directional_lights: Query<
@@ -343,6 +364,7 @@ pub fn check_dir_light_mesh_visibility(
         (
             Without<NotShadowCaster>,
             Without<DirectionalLight>,
+            Without<NoCpuCulling>,
             With<Mesh3d>,
         ),
     >,
@@ -384,6 +406,13 @@ pub fn check_dir_light_mesh_visibility(
         let view_mask = maybe_view_mask.unwrap_or_default();
 
         for (view, view_frusta) in &frusta.frusta {
+            // Resize any per-thread buffer left at a stale state from a prior frame.
+            // Threads receiving no work this frame won't run the `init` closure from `par_iter`, and without this
+            // their buffer might be indexed out-of-bounds during collection if the number of cascades has increased.
+            for thread_queue in view_visible_entities_queue.iter_mut() {
+                thread_queue.resize(view_frusta.len(), Vec::default());
+            }
+
             visible_entity_query.par_iter().for_each_init(
                 || {
                     let mut entities = view_visible_entities_queue.borrow_local_mut();
@@ -472,7 +501,7 @@ pub fn check_dir_light_mesh_visibility(
     commands.queue(move |world: &mut World| {
         let mut query = world.query::<&mut ViewVisibility>();
         for entities in defer_queue.iter_mut() {
-            let mut iter = query.iter_many_mut(world, entities.iter());
+            let mut iter = query.iter_many_mut(world, entities.iter()).matched();
             while let Some(mut view_visibility) = iter.fetch_next() {
                 view_visibility.set_visible();
             }
@@ -480,10 +509,13 @@ pub fn check_dir_light_mesh_visibility(
     });
 }
 
-/// Updates the visibility for [`PointLight`]s and [`SpotLight`]s so that
-/// shadow map rendering can work.
+/// Updates the visibility for [`PointLight`]s and [`SpotLight`]s so that shadow
+/// map rendering can work.
+///
+/// This only processes entities without [`NoCpuCulling`]. Entities with
+/// [`NoCpuCulling`] receive no view-specific processing in the main world.
 pub fn check_point_light_mesh_visibility(
-    visible_point_lights: Query<&VisibleClusterableObjects>,
+    visible_point_lights: Query<&VisibleEntities>,
     mut point_lights: Query<(
         &PointLight,
         &GlobalTransform,
@@ -512,9 +544,13 @@ pub fn check_point_light_mesh_visibility(
         (
             Without<NotShadowCaster>,
             Without<DirectionalLight>,
+            Without<NoCpuCulling>,
             With<Mesh3d>,
         ),
     >,
+    mut camera_query: Query<(Entity, &RenderTarget), With<Camera>>,
+    mut shadow_lod_origin_query: Query<Entity, With<ShadowLodOrigin>>,
+    mut point_and_spot_light_query: Query<Entity, Or<(With<PointLight>, With<SpotLight>)>>,
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
     mut cubemap_visible_entities_queue: Local<Parallel<[Vec<Entity>; 6]>>,
     mut spot_visible_entities_queue: Local<Parallel<Vec<Entity>>>,
@@ -522,9 +558,15 @@ pub fn check_point_light_mesh_visibility(
 ) {
     checked_lights.clear();
 
+    let shadow_lod_origin = get_shadow_lod_origin(
+        camera_query.transmute_lens_filtered(),
+        shadow_lod_origin_query.transmute_lens_filtered(),
+        point_and_spot_light_query.transmute_lens_filtered(),
+    );
+
     let visible_entity_ranges = visible_entity_ranges.as_deref();
     for visible_lights in &visible_point_lights {
-        for light_entity in visible_lights.point_and_spot_lights.iter().copied() {
+        for &light_entity in visible_lights.get(TypeId::of::<ClusterVisibilityClass>()) {
             if !checked_lights.insert(light_entity) {
                 continue;
             }
@@ -571,7 +613,10 @@ pub fn check_point_light_mesh_visibility(
                         }
                         if has_visibility_range
                             && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                                !visible_entity_ranges.entity_is_in_range_of_any_view(entity)
+                                shadow_lod_origin.is_none_or(|shadow_lod_origin| {
+                                    !visible_entity_ranges
+                                        .entity_is_in_range_of_view(entity, shadow_lod_origin)
+                                })
                             })
                         {
                             return;
@@ -661,7 +706,10 @@ pub fn check_point_light_mesh_visibility(
                         // Check visibility ranges.
                         if has_visibility_range
                             && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                                !visible_entity_ranges.entity_is_in_range_of_any_view(entity)
+                                shadow_lod_origin.is_none_or(|shadow_lod_origin| {
+                                    !visible_entity_ranges
+                                        .entity_is_in_range_of_view(entity, shadow_lod_origin)
+                                })
                             })
                         {
                             return;
@@ -698,4 +746,55 @@ pub fn check_point_light_mesh_visibility(
             }
         }
     }
+}
+
+/// Determines the LOD origin for spot and point light shadow maps.
+///
+/// The selection priority is, from highest to lowest:
+///
+/// 1. An entity explicitly marked with the [`ShadowLodOrigin`] component.
+///
+/// 2. A camera that renders to a window.
+///
+/// 3. Any camera.
+pub fn get_shadow_lod_origin(
+    mut camera_query: QueryLens<(Entity, &RenderTarget), With<Camera>>,
+    mut shadow_lod_origin_query: QueryLens<Entity, With<ShadowLodOrigin>>,
+    mut lights_query: QueryLens<Entity, Or<(With<PointLight>, With<SpotLight>)>>,
+) -> Option<Entity> {
+    let (camera_query, shadow_lod_origin_query) =
+        (camera_query.query(), shadow_lod_origin_query.query());
+
+    let mut entities: SmallVec<[Entity; 4]> = smallvec![];
+    entities.extend(shadow_lod_origin_query.iter());
+    if let Some(lod_origin) = entities.iter().min() {
+        return Some(*lod_origin);
+    }
+
+    entities.extend(
+        camera_query
+            .iter()
+            .filter_map(|(main_entity, render_target)| match *render_target {
+                RenderTarget::Window(_) => Some(main_entity),
+                _ => None,
+            }),
+    );
+    if let Some(lod_origin) = entities.iter().min() {
+        return Some(*lod_origin);
+    };
+
+    entities.extend(camera_query.iter().map(|(main_entity, _)| main_entity));
+    if let Some(lod_origin) = entities.iter().min() {
+        if !lights_query.query().is_empty() {
+            warn_once!(
+                "Point lights and/or spot lights are present, but no entity has \
+                 `ShadowLodOrigin`, and no camera that renders to the window has been found. \
+                 Consider using the `ShadowLodOrigin` component to set a LOD origin."
+            );
+        }
+
+        return Some(*lod_origin);
+    };
+
+    None
 }

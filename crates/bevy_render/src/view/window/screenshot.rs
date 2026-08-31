@@ -1,4 +1,3 @@
-use super::ExtractedWindows;
 use crate::{
     gpu_readback,
     render_asset::RenderAssets,
@@ -7,9 +6,13 @@ use crate::{
         SpecializedRenderPipeline, SpecializedRenderPipelines, Texture, TextureUsages, TextureView,
     },
     renderer::RenderDevice,
+    sync_world::MainEntity,
     texture::{GpuImage, ManualTextureViews, OutputColorAttachment},
-    view::{prepare_view_attachments, prepare_view_targets, ViewTargetAttachments, WindowSurfaces},
-    ExtractSchedule, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
+    view::{
+        prepare_view_attachments, prepare_view_targets, ExtractedWindow, SurfaceData,
+        ViewTargetAttachments,
+    },
+    ExtractSchedule, GpuResourceAppExt, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use alloc::{borrow::Cow, sync::Arc};
 use bevy_app::{First, Plugin, Update};
@@ -45,7 +48,7 @@ use std::{
 use wgpu::{CommandEncoder, Extent3d, TextureFormat};
 
 #[derive(EntityEvent, Reflect, Deref, DerefMut, Debug)]
-#[reflect(Debug)]
+#[reflect(Debug, Event)]
 pub struct ScreenshotCaptured {
     pub entity: Entity,
     #[deref]
@@ -229,7 +232,8 @@ fn extract_screenshots(
         *system_state = Some(SystemState::new(&mut main_world));
     }
     let system_state = system_state.as_mut().unwrap();
-    let (mut commands, primary_window, screenshots) = system_state.get_mut(&mut main_world);
+    let (mut commands, primary_window, screenshots) =
+        system_state.get_mut(&mut main_world).unwrap();
 
     targets.clear();
     seen_targets.clear();
@@ -265,7 +269,7 @@ fn extract_screenshots(
 fn prepare_screenshots(
     targets: Res<RenderScreenshotTargets>,
     mut prepared: ResMut<RenderScreenshotsPrepared>,
-    window_surfaces: Res<WindowSurfaces>,
+    window_surfaces: Query<(MainEntity, &SurfaceData)>,
     render_device: Res<RenderDevice>,
     screenshot_pipeline: Res<ScreenshotToScreenPipeline>,
     pipeline_cache: Res<PipelineCache>,
@@ -279,7 +283,8 @@ fn prepare_screenshots(
         match target {
             NormalizedRenderTarget::Window(window) => {
                 let window = window.entity();
-                let Some(surface_data) = window_surfaces.surfaces.get(&window) else {
+                let Some((_, surface_data)) = window_surfaces.iter().find(|(e, _)| *e == window)
+                else {
                     warn!("Unknown window for screenshot, skipping: {}", window);
                     continue;
                 };
@@ -406,10 +411,12 @@ pub struct ScreenshotPlugin;
 
 impl Plugin for ScreenshotPlugin {
     fn build(&self, app: &mut bevy_app::App) {
-        embedded_asset!(app, "screenshot.wgsl");
+        embedded_asset!(app, "screenshot.wesl");
 
         let (tx, rx) = std::sync::mpsc::channel();
-        app.insert_resource(CapturedScreenshots(Arc::new(Mutex::new(rx))))
+        app.register_type::<Screenshot>()
+            .register_type::<ScreenshotCaptured>()
+            .insert_resource(CapturedScreenshots(Arc::new(Mutex::new(rx))))
             .add_systems(
                 First,
                 clear_screenshots
@@ -426,7 +433,7 @@ impl Plugin for ScreenshotPlugin {
             .insert_resource(RenderScreenshotsSender(tx))
             .init_resource::<RenderScreenshotTargets>()
             .init_resource::<RenderScreenshotsPrepared>()
-            .init_resource::<SpecializedRenderPipelines<ScreenshotToScreenPipeline>>()
+            .init_gpu_resource::<SpecializedRenderPipelines<ScreenshotToScreenPipeline>>()
             .add_systems(RenderStartup, init_screenshot_to_screen_pipeline)
             .add_systems(ExtractSchedule, extract_screenshots.ambiguous_with_all())
             .add_systems(
@@ -454,7 +461,7 @@ pub fn init_screenshot_to_screen_pipeline(mut commands: Commands, asset_server: 
         ),
     );
 
-    let shader = load_embedded_asset!(asset_server.as_ref(), "screenshot.wgsl");
+    let shader = load_embedded_asset!(asset_server.as_ref(), "screenshot.wesl");
 
     commands.insert_resource(ScreenshotToScreenPipeline {
         bind_group_layout,
@@ -492,19 +499,27 @@ impl SpecializedRenderPipeline for ScreenshotToScreenPipeline {
     }
 }
 
-pub(crate) fn submit_screenshot_commands(world: &World, encoder: &mut CommandEncoder) {
+pub(crate) type SubmitScreenshotCommandsState<'w, 's> =
+    Query<'w, 's, (MainEntity, &'s ExtractedWindow)>;
+
+pub(crate) fn submit_screenshot_commands(
+    world: &World,
+    state: &mut SystemState<SubmitScreenshotCommandsState>,
+    encoder: &mut CommandEncoder,
+) {
     let targets = world.resource::<RenderScreenshotTargets>();
     let prepared = world.resource::<RenderScreenshotsPrepared>();
     let pipelines = world.resource::<PipelineCache>();
     let gpu_images = world.resource::<RenderAssets<GpuImage>>();
-    let windows = world.resource::<ExtractedWindows>();
     let manual_texture_views = world.resource::<ManualTextureViews>();
+
+    let windows = state.get(world).unwrap();
 
     for (entity, render_target) in targets.iter() {
         match render_target {
             NormalizedRenderTarget::Window(window) => {
                 let window = window.entity();
-                let Some(window) = windows.get(&window) else {
+                let Some((_, window)) = windows.iter().find(|(e, _)| *e == window) else {
                     continue;
                 };
                 let width = window.physical_width;
@@ -654,7 +669,7 @@ pub(crate) fn collect_screenshots(world: &mut World) {
                 tx.try_send(()).unwrap();
             });
             rx.recv().await.unwrap();
-            let data = buffer_slice.get_mapped_range();
+            let data = buffer_slice.get_mapped_range().unwrap();
             // we immediately move the data to CPU memory to avoid holding the mapped view for long
             let mut result = Vec::from(&*data);
             drop(data);
@@ -687,7 +702,7 @@ pub(crate) fn collect_screenshots(world: &mut World) {
                     wgpu::TextureDimension::D2,
                     result,
                     texture_format,
-                    RenderAssetUsages::RENDER_WORLD,
+                    RenderAssetUsages::MAIN_WORLD,
                 ),
             )) {
                 error!("Failed to send screenshot: {}", e);

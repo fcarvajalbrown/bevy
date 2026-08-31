@@ -17,11 +17,14 @@ use bevy_ecs::{
     query::ROQueryItem,
     system::{lifetimeless::*, SystemParamItem},
 };
-use bevy_image::{BevyDefault, Image, TextureAtlasLayout};
+use bevy_image::{Image, TextureAtlasLayout};
 use bevy_math::{Affine3A, FloatOrd, Quat, Rect, Vec2, Vec4};
 use bevy_mesh::VertexBufferLayout;
 use bevy_platform::collections::HashMap;
-use bevy_render::view::{RenderVisibleEntities, RetainedViewEntity};
+use bevy_render::{
+    camera::ExtractedCamera,
+    view::{RenderVisibleEntities, RetainedViewEntity},
+};
 use bevy_render::{
     render_asset::RenderAssets,
     render_phase::{
@@ -35,7 +38,10 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     sync_world::RenderEntity,
     texture::{FallbackImage, GpuImage},
-    view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+    view::{
+        texture_format_from_code, texture_format_to_code, ExtractedView, Msaa, ViewUniform,
+        ViewUniformOffset, ViewUniforms,
+    },
     Extract,
 };
 use bevy_shader::{Shader, ShaderDefVal};
@@ -80,7 +86,7 @@ pub fn init_sprite_pipeline(mut commands: Commands, asset_server: Res<AssetServe
     commands.insert_resource(SpritePipeline {
         view_layout,
         material_layout,
-        shader: load_embedded_asset!(asset_server.as_ref(), "sprite.wgsl"),
+        shader: load_embedded_asset!(asset_server.as_ref(), "sprite.wesl"),
     });
 }
 
@@ -91,12 +97,14 @@ bitflags::bitflags! {
     // MSAA uses the highest 3 bits for the MSAA log2(sample count) to support up to 128x MSAA.
     pub struct SpritePipelineKey: u32 {
         const NONE                              = 0;
-        const HDR                               = 1 << 0;
-        const TONEMAP_IN_SHADER                 = 1 << 1;
-        const DEBAND_DITHER                     = 1 << 2;
+        const TONEMAP_IN_SHADER                 = 1 << 0;
+        const DEBAND_DITHER                     = 1 << 1;
+        const SRGB_COMPOSITING                  = 1 << 2;
+        const OKLAB_COMPOSITING                 = 1 << 3;
+        const COLOR_TARGET_FORMAT_RESERVED_BITS = Self::COLOR_TARGET_FORMAT_MASK_BITS << Self::COLOR_TARGET_FORMAT_SHIFT_BITS;
         const MSAA_RESERVED_BITS                = Self::MSAA_MASK_BITS << Self::MSAA_SHIFT_BITS;
         const TONEMAP_METHOD_RESERVED_BITS      = Self::TONEMAP_METHOD_MASK_BITS << Self::TONEMAP_METHOD_SHIFT_BITS;
-        const TONEMAP_METHOD_NONE               = 0 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_LINEAR             = 0 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_REINHARD           = 1 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_REINHARD_LUMINANCE = 2 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_ACES_FITTED        = 3 << Self::TONEMAP_METHOD_SHIFT_BITS;
@@ -104,13 +112,17 @@ bitflags::bitflags! {
         const TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM = 5 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_TONY_MC_MAPFACE    = 6 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_BLENDER_FILMIC     = 7 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_PBR_NEUTRAL        = 8 << Self::TONEMAP_METHOD_SHIFT_BITS;
+
     }
 }
 
 impl SpritePipelineKey {
+    const COLOR_TARGET_FORMAT_MASK_BITS: u32 = bevy_render::view::COLOR_TARGET_FORMAT_MASK_BITS;
+    const COLOR_TARGET_FORMAT_SHIFT_BITS: u32 = 4;
     const MSAA_MASK_BITS: u32 = 0b111;
     const MSAA_SHIFT_BITS: u32 = 32 - Self::MSAA_MASK_BITS.count_ones();
-    const TONEMAP_METHOD_MASK_BITS: u32 = 0b111;
+    const TONEMAP_METHOD_MASK_BITS: u32 = 0b1111;
     const TONEMAP_METHOD_SHIFT_BITS: u32 =
         Self::MSAA_SHIFT_BITS - Self::TONEMAP_METHOD_MASK_BITS.count_ones();
 
@@ -126,13 +138,23 @@ impl SpritePipelineKey {
         1 << ((self.bits() >> Self::MSAA_SHIFT_BITS) & Self::MSAA_MASK_BITS)
     }
 
+    /// Create a pipeline key from the view's color target format.
     #[inline]
-    pub const fn from_hdr(hdr: bool) -> Self {
-        if hdr {
-            SpritePipelineKey::HDR
-        } else {
-            SpritePipelineKey::NONE
-        }
+    pub fn from_target_format(format: TextureFormat) -> Self {
+        let code = texture_format_to_code(format)
+            .expect("Texture format is not supported by the pipeline") as u32;
+        Self::from_bits_retain(
+            (code & Self::COLOR_TARGET_FORMAT_MASK_BITS) << Self::COLOR_TARGET_FORMAT_SHIFT_BITS,
+        )
+    }
+
+    /// Color target format of the main pass for this pipeline key.
+    #[inline]
+    pub fn target_format(&self) -> TextureFormat {
+        let code = ((self.bits() >> Self::COLOR_TARGET_FORMAT_SHIFT_BITS)
+            & Self::COLOR_TARGET_FORMAT_MASK_BITS) as u8;
+        texture_format_from_code(code)
+            .expect("Unknown bits in `COLOR_TARGET_FORMAT_MASK_BITS` of the pipeline key")
     }
 }
 
@@ -154,8 +176,8 @@ impl SpecializedRenderPipeline for SpritePipeline {
 
             let method = key.intersection(SpritePipelineKey::TONEMAP_METHOD_RESERVED_BITS);
 
-            if method == SpritePipelineKey::TONEMAP_METHOD_NONE {
-                shader_defs.push("TONEMAP_METHOD_NONE".into());
+            if method == SpritePipelineKey::TONEMAP_METHOD_LINEAR {
+                shader_defs.push("TONEMAP_METHOD_LINEAR".into());
             } else if method == SpritePipelineKey::TONEMAP_METHOD_REINHARD {
                 shader_defs.push("TONEMAP_METHOD_REINHARD".into());
             } else if method == SpritePipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE {
@@ -171,6 +193,8 @@ impl SpecializedRenderPipeline for SpritePipeline {
                 shader_defs.push("TONEMAP_METHOD_BLENDER_FILMIC".into());
             } else if method == SpritePipelineKey::TONEMAP_METHOD_TONY_MC_MAPFACE {
                 shader_defs.push("TONEMAP_METHOD_TONY_MC_MAPFACE".into());
+            } else if method == SpritePipelineKey::TONEMAP_METHOD_PBR_NEUTRAL {
+                shader_defs.push("TONEMAP_METHOD_PBR_NEUTRAL".into());
             }
 
             // Debanding is tied to tonemapping in the shader, cannot run without it.
@@ -179,10 +203,14 @@ impl SpecializedRenderPipeline for SpritePipeline {
             }
         }
 
-        let format = match key.contains(SpritePipelineKey::HDR) {
-            true => ViewTarget::TEXTURE_FORMAT_HDR,
-            false => TextureFormat::bevy_default(),
-        };
+        if key.contains(SpritePipelineKey::SRGB_COMPOSITING) {
+            shader_defs.push("SRGB_OUTPUT".into());
+        }
+        if key.contains(SpritePipelineKey::OKLAB_COMPOSITING) {
+            shader_defs.push("OKLAB_OUTPUT".into());
+        }
+
+        let format = key.target_format();
 
         let instance_rate_vertex_buffer_layout = VertexBufferLayout {
             array_stride: 80,
@@ -244,8 +272,8 @@ impl SpecializedRenderPipeline for SpritePipeline {
             // that wrote to depth is present.
             depth_stencil: Some(DepthStencilState {
                 format: CORE_2D_DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: CompareFunction::GreaterEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::GreaterEqual),
                 stencil: StencilState {
                     front: StencilFaceState::IGNORE,
                     back: StencilFaceState::IGNORE,
@@ -476,8 +504,9 @@ pub fn queue_sprites(
     pipeline_cache: Res<PipelineCache>,
     extracted_sprites: Res<ExtractedSprites>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
-    mut views: Query<(
+    mut cameras: Query<(
         &RenderVisibleEntities,
+        &ExtractedCamera,
         &ExtractedView,
         &Msaa,
         Option<&Tonemapping>,
@@ -486,33 +515,48 @@ pub fn queue_sprites(
 ) {
     let draw_sprite_function = draw_functions.read().id::<DrawSprite>();
 
-    for (visible_entities, view, msaa, tonemapping, dither) in &mut views {
+    for (visible_entities, camera, view, msaa, tonemapping, dither) in &mut cameras {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
         else {
             continue;
         };
 
         let msaa_key = SpritePipelineKey::from_msaa_samples(msaa.samples());
-        let mut view_key = SpritePipelineKey::from_hdr(view.hdr) | msaa_key;
+        let mut view_key = SpritePipelineKey::from_target_format(view.target_format) | msaa_key;
 
-        if !view.hdr {
-            if let Some(tonemapping) = tonemapping {
-                view_key |= SpritePipelineKey::TONEMAP_IN_SHADER;
-                view_key |= match tonemapping {
-                    Tonemapping::None => SpritePipelineKey::TONEMAP_METHOD_NONE,
-                    Tonemapping::Reinhard => SpritePipelineKey::TONEMAP_METHOD_REINHARD,
-                    Tonemapping::ReinhardLuminance => {
-                        SpritePipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
-                    }
-                    Tonemapping::AcesFitted => SpritePipelineKey::TONEMAP_METHOD_ACES_FITTED,
-                    Tonemapping::AgX => SpritePipelineKey::TONEMAP_METHOD_AGX,
-                    Tonemapping::SomewhatBoringDisplayTransform => {
-                        SpritePipelineKey::TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM
-                    }
-                    Tonemapping::TonyMcMapface => SpritePipelineKey::TONEMAP_METHOD_TONY_MC_MAPFACE,
-                    Tonemapping::BlenderFilmic => SpritePipelineKey::TONEMAP_METHOD_BLENDER_FILMIC,
-                };
-            }
+        if camera
+            .compositing_space
+            .is_some_and(|s| s == bevy_camera::CompositingSpace::Srgb)
+        {
+            view_key |= SpritePipelineKey::SRGB_COMPOSITING;
+        }
+        if camera
+            .compositing_space
+            .is_some_and(|s| s == bevy_camera::CompositingSpace::Oklab)
+        {
+            view_key |= SpritePipelineKey::OKLAB_COMPOSITING;
+        }
+
+        if !camera.hdr
+            && let Some(tonemapping) = tonemapping
+            && tonemapping.is_enabled()
+        {
+            view_key |= SpritePipelineKey::TONEMAP_IN_SHADER;
+            view_key |= match tonemapping {
+                Tonemapping::None | Tonemapping::Linear => SpritePipelineKey::TONEMAP_METHOD_LINEAR,
+                Tonemapping::Reinhard => SpritePipelineKey::TONEMAP_METHOD_REINHARD,
+                Tonemapping::ReinhardLuminance => {
+                    SpritePipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
+                }
+                Tonemapping::AcesFitted => SpritePipelineKey::TONEMAP_METHOD_ACES_FITTED,
+                Tonemapping::AgX => SpritePipelineKey::TONEMAP_METHOD_AGX,
+                Tonemapping::SomewhatBoringDisplayTransform => {
+                    SpritePipelineKey::TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM
+                }
+                Tonemapping::TonyMcMapface => SpritePipelineKey::TONEMAP_METHOD_TONY_MC_MAPFACE,
+                Tonemapping::BlenderFilmic => SpritePipelineKey::TONEMAP_METHOD_BLENDER_FILMIC,
+                Tonemapping::KhronosPbrNeutral => SpritePipelineKey::TONEMAP_METHOD_PBR_NEUTRAL,
+            };
             if let Some(DebandDither::Enabled) = dither {
                 view_key |= SpritePipelineKey::DEBAND_DITHER;
             }
@@ -524,8 +568,7 @@ pub fn queue_sprites(
         if let Some(visible_entities) = visible_entities.get::<Sprite>() {
             view_entities.extend(
                 visible_entities
-                    .entities
-                    .iter()
+                    .iter_visible()
                     .map(|(_, e)| e.index_u32() as usize),
             );
         }
@@ -824,7 +867,7 @@ pub fn prepare_sprite_image_bind_groups(
             // The sprite shader can then use the two least significant bits as the vertex index.
             // The rest of the properties to transform the vertex positions and UVs (which are
             // implicit) are baked into the instance transform, and UV offset and scale.
-            // See bevy_sprite_render/src/render/sprite.wgsl for the details.
+            // See bevy_sprite_render/src/render/sprite.wesl for the details.
             sprite_meta.sprite_index_buffer.push(2);
             sprite_meta.sprite_index_buffer.push(0);
             sprite_meta.sprite_index_buffer.push(1);

@@ -114,7 +114,7 @@
 //! - [`FilteredResources`](crate::world::FilteredResources)
 //! - [`FilteredResourcesMut`](crate::world::FilteredResourcesMut)
 //! - [`DynSystemParam`]
-//! - [`Vec<P>`] where `P: SystemParam`
+//! - [`Vec<P>`] and [`SmallVec<[P, N]>`](smallvec::SmallVec) where `P: SystemParam`
 //! - [`ParamSet<Vec<P>>`] where `P: SystemParam`
 //!
 //! [`Vec<P>`]: alloc::vec::Vec
@@ -1370,7 +1370,7 @@ mod tests {
             Option<Single<&B>>,
             ParamSet<(Query<&C>, Query<&D>)>,
         )> = SystemState::new(&mut world);
-        let (a, query, _) = system_state.get(&world);
+        let (a, query, _) = system_state.get(&world).unwrap();
         assert_eq!(*a, A(42), "returned resource matches initial value");
         assert_eq!(
             **query.unwrap(),
@@ -1397,7 +1397,7 @@ mod tests {
         // The following line shouldn't compile because the parameters used are not ReadOnlySystemParam
         // let (a, query) = system_state.get(&world);
 
-        let (a, query) = system_state.get_mut(&mut world);
+        let (a, query) = system_state.get_mut(&mut world).unwrap();
         assert_eq!(*a, A(42), "returned resource matches initial value");
         assert_eq!(
             **query.unwrap(),
@@ -1417,18 +1417,18 @@ mod tests {
         let mut system_state: SystemState<Option<Single<&A, Changed<A>>>> =
             SystemState::new(&mut world);
         {
-            let query = system_state.get(&world);
+            let query = system_state.get(&world).unwrap();
             assert_eq!(**query.unwrap(), A(1));
         }
 
         {
-            let query = system_state.get(&world);
+            let query = system_state.get(&world).unwrap();
             assert!(query.is_none());
         }
 
         world.entity_mut(entity).get_mut::<A>().unwrap().0 = 2;
         {
-            let query = system_state.get(&world);
+            let query = system_state.get(&world).unwrap();
             assert_eq!(**query.unwrap(), A(2));
         }
     }
@@ -1442,12 +1442,12 @@ mod tests {
         let mut system_state: SystemState<Option<Single<(&A, SpawnDetails), Spawned>>> =
             SystemState::new(&mut world);
         {
-            let query = system_state.get(&world);
+            let query = system_state.get(&world).unwrap();
             assert_eq!(query.unwrap().1.spawn_tick(), spawn_tick);
         }
 
         {
-            let query = system_state.get(&world);
+            let query = system_state.get(&world).unwrap();
             assert!(query.is_none());
         }
     }
@@ -1458,7 +1458,7 @@ mod tests {
         let mut world = World::default();
         let mut system_state = SystemState::<Query<&A>>::new(&mut world);
         let mismatched_world = World::default();
-        system_state.get(&mismatched_world);
+        system_state.get(&mismatched_world).unwrap();
     }
 
     #[test]
@@ -1474,7 +1474,7 @@ mod tests {
 
         let mut system_state = SystemState::<Query<&A>>::new(&mut world);
         {
-            let query = system_state.get(&world);
+            let query = system_state.get(&world).unwrap();
             assert_eq!(
                 query.iter().collect::<Vec<_>>(),
                 vec![&A(1)],
@@ -1484,7 +1484,7 @@ mod tests {
 
         world.spawn((A(2), B(2)));
         {
-            let query = system_state.get(&world);
+            let query = system_state.get(&world).unwrap();
             assert_eq!(
                 query.iter().collect::<Vec<_>>(),
                 vec![&A(1), &A(2)],
@@ -1514,19 +1514,19 @@ mod tests {
 
         impl State {
             fn hold_res<'w>(&mut self, world: &'w World) -> ResourceHolder<'w> {
-                let a = self.state.get(world);
+                let a = self.state.get(world).unwrap();
                 ResourceHolder {
                     value: a.into_inner(),
                 }
             }
             fn hold_component<'w>(&mut self, world: &'w World, entity: Entity) -> Holder<'w> {
-                let q = self.state_q.get(world);
+                let q = self.state_q.get(world).unwrap();
                 let a = q.get_inner(entity).unwrap();
                 Holder { value: a }
             }
             fn hold_components<'w>(&mut self, world: &'w World) -> Vec<Holder<'w>> {
                 let mut components = Vec::new();
-                let q = self.state_q.get(world);
+                let q = self.state_q.get(world).unwrap();
                 for a in q.iter_inner() {
                     components.push(Holder { value: a });
                 }
@@ -1546,7 +1546,7 @@ mod tests {
 
         let mut system_state = SystemState::<Query<&mut A>>::new(&mut world);
         {
-            let mut query = system_state.get_mut(&mut world);
+            let mut query = system_state.get_mut(&mut world).unwrap();
             assert_eq!(
                 query.iter_mut().map(|m| *m).collect::<Vec<A>>(),
                 vec![A(1), A(2)],
@@ -2017,14 +2017,14 @@ mod tests {
         schedule.add_systems(|_query: Query<&Name>| todo!());
         schedule.add_systems(|_query: Query<&Name>| -> () { todo!() });
 
-        fn obs(_event: On<Add, Name>) {
+        fn obs(_event: On<Add<Name>>) {
             todo!()
         }
 
         world.add_observer(obs);
-        world.add_observer(|_event: On<Add, Name>| {});
-        world.add_observer(|_event: On<Add, Name>| todo!());
-        world.add_observer(|_event: On<Add, Name>| -> () { todo!() });
+        world.add_observer(|_event: On<Add<Name>>| {});
+        world.add_observer(|_event: On<Add<Name>>| todo!());
+        world.add_observer(|_event: On<Add<Name>>| -> () { todo!() });
 
         fn my_command(_world: &mut World) {
             todo!()

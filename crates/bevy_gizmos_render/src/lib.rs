@@ -18,6 +18,8 @@ pub enum GizmoRenderSystems {
 }
 
 pub mod retained;
+#[cfg(feature = "bevy_pbr")]
+pub mod transform_gizmo_render;
 
 #[cfg(feature = "bevy_sprite_render")]
 mod pipeline_2d;
@@ -86,8 +88,8 @@ impl Plugin for GizmoRenderPlugin {
     fn build(&self, app: &mut App) {
         {
             use bevy_asset::embedded_asset;
-            embedded_asset!(app, "lines.wgsl");
-            embedded_asset!(app, "line_joints.wgsl");
+            embedded_asset!(app, "lines.wesl");
+            embedded_asset!(app, "line_joints.wesl");
         }
 
         app.add_plugins(UniformComponentPlugin::<LineGizmoUniform>::default())
@@ -114,6 +116,7 @@ impl Plugin for GizmoRenderPlugin {
             #[cfg(feature = "bevy_pbr")]
             if app.is_plugin_added::<bevy_pbr::PbrPlugin>() {
                 app.add_plugins(pipeline_3d::LineGizmo3dPlugin);
+                app.add_plugins(transform_gizmo_render::TransformGizmoRenderPlugin);
             } else {
                 tracing::warn!("bevy_pbr feature is enabled but bevy_pbr::PbrPlugin was not detected. Are you sure you loaded GizmoPlugin after PbrPlugin?");
             }
@@ -211,7 +214,7 @@ fn extract_gizmo_data(
             // The immediate mode API does not have a main world entity to refer to,
             // but we do need MainEntity on this render entity for the systems to find it.
             MainEntity::from(Entity::PLACEHOLDER),
-            TemporaryRenderEntity,
+            TemporaryRenderEntity::default(),
         ));
     }
 }
@@ -618,6 +621,7 @@ fn line_joint_gizmo_vertex_buffer_layouts() -> Vec<VertexBufferLayout> {
 /// can be added and therefore three potential entities.
 #[derive(Clone, Reflect, Resource, ExtractResource)]
 #[reflect(Clone, Resource)]
+#[extract_app(RenderApp)]
 pub struct LineGizmoEntities {
     /// An entity that regular line phase items are associated with.
     pub line_gizmo_renderer: MainEntity,

@@ -11,19 +11,22 @@ use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_render::{
-    extract_resource::ExtractResourcePlugin,
     mesh::{
-        allocator::{allocate_and_free_meshes, MeshAllocator},
+        allocator::{allocate_and_free_meshes, MeshAllocatorSettings},
         RenderMesh,
     },
     render_asset::prepare_assets,
     render_resource::BufferUsages,
     renderer::RenderDevice,
-    ExtractSchedule, Render, RenderApp, RenderSystems,
+    ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
 use binder::prepare_raytracing_scene_bindings;
 use blas::{compact_raytracing_blas, prepare_raytracing_blas, BlasManager};
-use extract::{extract_raytracing_scene, StandardMaterialAssets};
+use extract::{
+    extract_raytracing_material_assets, extract_raytracing_scene_meshes_and_materials,
+    extract_raytracing_scene_structural, extract_raytracing_scene_transforms,
+    StandardMaterialAssets,
+};
 use tracing::warn;
 
 /// Creates acceleration structures and binding arrays of resources for raytracing.
@@ -31,9 +34,9 @@ pub struct RaytracingScenePlugin;
 
 impl Plugin for RaytracingScenePlugin {
     fn build(&self, app: &mut App) {
-        load_shader_library!(app, "brdf.wgsl");
-        load_shader_library!(app, "raytracing_scene_bindings.wgsl");
-        load_shader_library!(app, "sampling.wgsl");
+        load_shader_library!(app, "brdf.wesl");
+        load_shader_library!(app, "bindings.wesl");
+        load_shader_library!(app, "sampling.wesl");
     }
 
     fn finish(&self, app: &mut App) {
@@ -48,20 +51,26 @@ impl Plugin for RaytracingScenePlugin {
             return;
         }
 
-        app.add_plugins(ExtractResourcePlugin::<StandardMaterialAssets>::default());
-
         let render_app = app.sub_app_mut(RenderApp);
 
         render_app
             .world_mut()
-            .resource_mut::<MeshAllocator>()
+            .resource_mut::<MeshAllocatorSettings>()
             .extra_buffer_usages |= BufferUsages::BLAS_INPUT | BufferUsages::STORAGE;
 
         render_app
-            .init_resource::<BlasManager>()
-            .init_resource::<StandardMaterialAssets>()
+            .init_gpu_resource::<BlasManager>()
+            .init_gpu_resource::<StandardMaterialAssets>()
             .insert_resource(RaytracingSceneBindings::new())
-            .add_systems(ExtractSchedule, extract_raytracing_scene)
+            .add_systems(
+                ExtractSchedule,
+                (
+                    extract_raytracing_scene_structural,
+                    extract_raytracing_scene_transforms,
+                    extract_raytracing_scene_meshes_and_materials,
+                    extract_raytracing_material_assets,
+                ),
+            )
             .add_systems(
                 Render,
                 (

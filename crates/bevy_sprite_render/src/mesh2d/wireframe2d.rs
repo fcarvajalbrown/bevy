@@ -30,10 +30,9 @@ use bevy_render::{
     },
     extract_resource::ExtractResource,
     mesh::{
-        allocator::{MeshAllocator, SlabId},
+        allocator::{MeshAllocator, MeshSlabId, MeshSlabs},
         RenderMesh,
     },
-    prelude::*,
     render_asset::{
         prepare_assets, PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets,
     },
@@ -45,11 +44,13 @@ use bevy_render::{
     },
     render_resource::*,
     renderer::{RenderContext, ViewQuery},
-    sync_world::{MainEntity, MainEntityHashMap},
+    sync_world::{MainEntity, MainEntityHashMap, MainEntityHashSet},
     view::{
-        ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewDepthTexture, ViewTarget,
+        ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewDepthStencilTexture,
+        ViewTarget,
     },
-    Extract, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
+    Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderDebugFlags,
+    RenderStartup, RenderSystems,
 };
 use bevy_shader::Shader;
 use core::{hash::Hash, ops::Range};
@@ -79,7 +80,7 @@ impl Wireframe2dPlugin {
 
 impl Plugin for Wireframe2dPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "wireframe2d.wgsl");
+        embedded_asset!(app, "wireframe2d.wesl");
 
         app.add_plugins((
             BinnedRenderPhasePlugin::<Wireframe2dPhaseItem, Mesh2dPipeline>::new(self.debug_flags),
@@ -112,11 +113,11 @@ impl Plugin for Wireframe2dPlugin {
         };
 
         render_app
-            .init_resource::<SpecializedWireframePipelineCache>()
+            .init_gpu_resource::<SpecializedWireframePipelineCache>()
             .init_resource::<DrawFunctions<Wireframe2dPhaseItem>>()
             .add_render_command::<Wireframe2dPhaseItem, DrawWireframe2d>()
             .init_resource::<RenderWireframeInstances>()
-            .init_resource::<SpecializedMeshPipelines<Wireframe2dPipeline>>()
+            .init_gpu_resource::<SpecializedMeshPipelines<Wireframe2dPipeline>>()
             .init_resource::<PendingWireframe2dQueues>()
             .add_systems(
                 Core2d,
@@ -249,16 +250,17 @@ pub struct Wireframe2dBatchSetKey {
 
     /// The function used to draw.
     pub draw_function: DrawFunctionId,
+
     /// The ID of the slab of GPU memory that contains vertex data.
     ///
     /// For non-mesh items, you can fill this with 0 if your items can be
     /// multi-drawn, or with a unique value if they can't.
-    pub vertex_slab: SlabId,
+    pub vertex_slab: MeshSlabId,
 
     /// The ID of the slab of GPU memory that contains index data, if present.
     ///
     /// For non-mesh items, you can safely fill this with `None`.
-    pub index_slab: Option<SlabId>,
+    pub index_slab: Option<MeshSlabId>,
 }
 
 impl PhaseItemBatchSetKey for Wireframe2dBatchSetKey {
@@ -327,7 +329,7 @@ pub fn init_wireframe_2d_pipeline(
 ) {
     commands.insert_resource(Wireframe2dPipeline {
         mesh_pipeline: mesh_2d_pipeline.clone(),
-        shader: load_embedded_asset!(asset_server.as_ref(), "wireframe2d.wgsl"),
+        shader: load_embedded_asset!(asset_server.as_ref(), "wireframe2d.wesl"),
     });
 }
 
@@ -345,7 +347,9 @@ impl SpecializedMeshPipeline for Wireframe2dPipeline {
         let fragment = descriptor.fragment.as_mut().unwrap();
         fragment.shader = self.shader.clone();
         descriptor.primitive.polygon_mode = PolygonMode::Line;
-        descriptor.depth_stencil.as_mut().unwrap().bias.slope_scale = 1.0;
+        if descriptor.primitive.topology.is_triangles() {
+            descriptor.depth_stencil.as_mut().unwrap().bias.slope_scale = 1.0;
+        }
         Ok(descriptor)
     }
 }
@@ -356,7 +360,7 @@ pub(crate) fn wireframe_2d(
         &ExtractedCamera,
         &ExtractedView,
         &ViewTarget,
-        &ViewDepthTexture,
+        &ViewDepthStencilTexture,
     )>,
     wireframe_phases: Res<ViewBinnedRenderPhases<Wireframe2dPhaseItem>>,
     mut ctx: RenderContext,
@@ -418,6 +422,7 @@ pub struct NoWireframe2d;
 
 #[derive(Resource, Debug, Clone, Default, ExtractResource, Reflect)]
 #[reflect(Resource, Debug, Default)]
+#[extract_app(RenderApp)]
 pub struct Wireframe2dConfig {
     /// Whether to show wireframes for all meshes.
     /// Can be overridden for individual meshes by adding a [`Wireframe2d`] or [`NoWireframe2d`] component.
@@ -438,7 +443,9 @@ pub struct RenderWireframeMaterial {
     pub color: [f32; 4],
 }
 
-#[derive(Component, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq)]
+#[derive(
+    Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq,
+)]
 #[reflect(Component, Default, Clone, PartialEq)]
 pub struct Mesh2dWireframe(pub Handle<Wireframe2dMaterial>);
 
@@ -806,7 +813,7 @@ pub fn specialize_wireframes(
             };
 
             let mut mesh_key = *view_key;
-            mesh_key |= Mesh2dPipelineKey::from_primitive_topology(mesh.primitive_topology());
+            mesh_key |= Mesh2dPipelineKey::from_bits_retain(mesh.key_bits.bits());
 
             let pipeline_id =
                 pipelines.specialize(&pipeline_cache, &pipeline, mesh_key, &mesh.layout);
@@ -840,6 +847,7 @@ fn queue_wireframes(
     mut wireframe_2d_phases: ResMut<ViewBinnedRenderPhases<Wireframe2dPhaseItem>>,
     mut pending_wireframe2d_queues: ResMut<PendingWireframe2dQueues>,
     mut views: Query<(&ExtractedView, &RenderVisibleEntities)>,
+    mut mesh_instances_queued_this_iteration_scratch_space: Local<MainEntityHashSet>,
 ) {
     for (view, visible_entities) in &mut views {
         let Some(wireframe_phase) = wireframe_2d_phases.get_mut(&view.retained_view_entity) else {
@@ -877,6 +885,7 @@ fn queue_wireframes(
             view.retained_view_entity,
             visible_entities,
             &view_pending_wireframe2d_queues.prev_frame,
+            &mut mesh_instances_queued_this_iteration_scratch_space,
         ) {
             let Some(wireframe_instance) = render_wireframe_instances.get(visible_entity) else {
                 continue;
@@ -897,7 +906,14 @@ fn queue_wireframes(
             let Some(mesh_instance) = render_mesh_instances.get(visible_entity) else {
                 continue;
             };
-            let (vertex_slab, index_slab) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+            let Some(MeshSlabs {
+                vertex_slab_id: vertex_slab,
+                index_slab_id: index_slab,
+                ..
+            }) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id)
+            else {
+                continue;
+            };
             let bin_key = Wireframe2dBinKey {
                 asset_id: mesh_instance.mesh_asset_id.untyped(),
             };
@@ -905,7 +921,7 @@ fn queue_wireframes(
                 pipeline: pipeline_id,
                 asset_id: wireframe_instance.untyped(),
                 draw_function: draw_wireframe,
-                vertex_slab: vertex_slab.unwrap_or_default(),
+                vertex_slab,
                 index_slab,
             };
             wireframe_phase.add(

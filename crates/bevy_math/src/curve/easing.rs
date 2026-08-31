@@ -293,7 +293,7 @@ all_tuples_enumerated!(
 /// [the unit interval]: Interval::UNIT
 /// [`sample`]: EasingCurve::sample
 /// [`sample_clamped`]: EasingCurve::sample_clamped
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bevy_reflect", derive(bevy_reflect::Reflect))]
 pub struct EasingCurve<T> {
@@ -309,7 +309,7 @@ impl<T> EasingCurve<T> {
     ///
     /// [the unit interval]: Interval::UNIT
     /// [ease function]: EaseFunction
-    pub fn new(start: T, end: T, ease_fn: EaseFunction) -> Self {
+    pub const fn new(start: T, end: T, ease_fn: EaseFunction) -> Self {
         Self {
             start,
             end,
@@ -495,7 +495,7 @@ pub enum EaseFunction {
     ///
     #[doc = include_str!("../../images/easefunction/QuarticIn.svg")]
     QuarticIn,
-    /// `f(t) = (t - 1.0)³ * (1.0 - t) + 1.0`
+    /// `f(t) = 1.0 - (1.0 - t)⁴`
     ///
     #[doc = include_str!("../../images/easefunction/QuarticOut.svg")]
     QuarticOut,
@@ -610,7 +610,7 @@ pub enum EaseFunction {
     /// `f(t) ≈ 1.0 - 2.0^(-10.0 * t)`
     ///
     /// As with `EaseFunction::ExponentialIn`, the precise definition adjusts it slightly
-    // so it hits both `(0, 0)` and `(1, 1)`.
+    /// so it hits both `(0, 0)` and `(1, 1)`.
     ///
     #[doc = include_str!("../../images/easefunction/ExponentialOut.svg")]
     ExponentialOut,
@@ -636,7 +636,7 @@ pub enum EaseFunction {
     ///
     #[doc = include_str!("../../images/easefunction/BackIn.svg")]
     BackIn,
-    /// `f(t) = 1.0 +  2.70158 * (t - 1.0)³ - 1.70158 * (t - 1.0)²`
+    /// `f(t) = 1.0 + 2.70158 * (t - 1.0)³ + 1.70158 * (t - 1.0)²`
     ///
     #[doc = include_str!("../../images/easefunction/BackOut.svg")]
     BackOut,
@@ -743,7 +743,7 @@ pub struct CubicInOutCurve;
 #[derive(Copy, Clone)]
 pub struct QuarticInCurve;
 
-/// `f(t) = (t - 1.0)³ * (1.0 - t) + 1.0`
+/// `f(t) = 1.0 - (1.0 - t)⁴`
 ///
 #[doc = include_str!("../../images/easefunction/QuarticOut.svg")]
 #[derive(Copy, Clone)]
@@ -924,7 +924,7 @@ pub struct ElasticInOutCurve;
 #[derive(Copy, Clone)]
 pub struct BackInCurve;
 
-/// `f(t) = 1.0 +  2.70158 * (t - 1.0)³ - 1.70158 * (t - 1.0)²`
+/// `f(t) = 1.0 +  2.70158 * (t - 1.0)³ + 1.70158 * (t - 1.0)²`
 ///
 #[doc = include_str!("../../images/easefunction/BackOut.svg")]
 #[derive(Copy, Clone)]
@@ -1050,7 +1050,7 @@ mod easing_functions {
     use crate::{ops, FloatPow};
 
     #[inline]
-    pub(crate) fn linear(t: f32) -> f32 {
+    pub(crate) const fn linear(t: f32) -> f32 {
         t
     }
 
@@ -1089,15 +1089,15 @@ mod easing_functions {
     }
 
     #[inline]
-    pub(crate) fn quartic_in(t: f32) -> f32 {
+    pub(crate) const fn quartic_in(t: f32) -> f32 {
         t * t * t * t
     }
     #[inline]
-    pub(crate) fn quartic_out(t: f32) -> f32 {
+    pub(crate) const fn quartic_out(t: f32) -> f32 {
         1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t) * (1.0 - t)
     }
     #[inline]
-    pub(crate) fn quartic_in_out(t: f32) -> f32 {
+    pub(crate) const fn quartic_in_out(t: f32) -> f32 {
         if t < 0.5 {
             8.0 * t * t * t * t
         } else {
@@ -1106,15 +1106,15 @@ mod easing_functions {
     }
 
     #[inline]
-    pub(crate) fn quintic_in(t: f32) -> f32 {
+    pub(crate) const fn quintic_in(t: f32) -> f32 {
         t * t * t * t * t
     }
     #[inline]
-    pub(crate) fn quintic_out(t: f32) -> f32 {
+    pub(crate) const fn quintic_out(t: f32) -> f32 {
         1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t) * (1.0 - t) * (1.0 - t)
     }
     #[inline]
-    pub(crate) fn quintic_in_out(t: f32) -> f32 {
+    pub(crate) const fn quintic_in_out(t: f32) -> f32 {
         if t < 0.5 {
             16.0 * t * t * t * t * t
         } else {
@@ -1128,32 +1128,32 @@ mod easing_functions {
     }
 
     #[inline]
-    pub(crate) fn smoothstep_in(t: f32) -> f32 {
+    pub(crate) const fn smoothstep_in(t: f32) -> f32 {
         ((1.5 - 0.5 * t) * t) * t
     }
 
     #[inline]
-    pub(crate) fn smoothstep_out(t: f32) -> f32 {
+    pub(crate) const fn smoothstep_out(t: f32) -> f32 {
         (1.5 + (-0.5 * t) * t) * t
     }
 
     #[inline]
-    pub(crate) fn smoothstep(t: f32) -> f32 {
+    pub(crate) const fn smoothstep(t: f32) -> f32 {
         ((3.0 - 2.0 * t) * t) * t
     }
 
     #[inline]
-    pub(crate) fn smootherstep_in(t: f32) -> f32 {
+    pub(crate) const fn smootherstep_in(t: f32) -> f32 {
         (((2.5 + (-1.875 + 0.375 * t) * t) * t) * t) * t
     }
 
     #[inline]
-    pub(crate) fn smootherstep_out(t: f32) -> f32 {
+    pub(crate) const fn smootherstep_out(t: f32) -> f32 {
         (1.875 + ((-1.25 + (0.375 * t) * t) * t) * t) * t
     }
 
     #[inline]
-    pub(crate) fn smootherstep(t: f32) -> f32 {
+    pub(crate) const fn smootherstep(t: f32) -> f32 {
         (((10.0 + (-15.0 + 6.0 * t) * t) * t) * t) * t
     }
 
